@@ -69,6 +69,7 @@ typedef struct {
 	char input_text_color[12];
 	char output_text_color[12];
 	char prompt_string[512];
+	int hide_mux_log;
 } cli_profile_t;
 
 static const int log_uuid_short_length = 8;
@@ -91,6 +92,7 @@ static cli_profile_t *global_profile;
 static int running = 1;
 static int thread_running = 0, thread_up = 0, check_up = 0;
 static char *filter_uuid;
+static char *logfilterex;
 static char *logfilter;
 static int timeout = 0;
 static int connect_timeout = 0;
@@ -633,7 +635,8 @@ static const char *usage_str =
 	"  -t, --timeout                   Timeout for API commands (in milliseconds)\n"
 	"  -T, --connect-timeout           Timeout for socket connection (in milliseconds)\n"
 	"  -n, --no-color                  Disable color\n"
-	"  -s, --set-log-uuid              Set UUID to filter log events\n\n";
+	"  -s, --set-log-uuid              Set UUID to filter log events\n"
+	"  -m, --muxing-hide               Hide audio muxing warning messages\n\n";
 
 static int usage(char *name){
 	printf(usage_str, name);
@@ -702,7 +705,7 @@ static void redisplay(void)
 		{
 			int pos = (int)(lf->cursor - lf->buffer);
 			char s1[12], s2[12] = "";
-			
+
 			putchar('\r');
 			snprintf(s1, sizeof(s1), "\033[%dC", bare_prompt_str_len);
 			if (pos) snprintf(s2, sizeof(s2), "\033[%dC", pos);
@@ -745,7 +748,7 @@ static void *msg_thread_run(esl_thread_t *me, void *obj)
 		esl_mutex_lock(MUTEX);
 		status = esl_recv_event_timed(handle, 10, 1, NULL);
 		esl_mutex_unlock(MUTEX);
-		
+
 		if (status == ESL_BREAK) {
 			sleep_ms(1);
 		} else if (status == ESL_FAIL) {
@@ -768,6 +771,18 @@ static void *msg_thread_run(esl_thread_t *me, void *obj)
 #endif
 							if (logfilter) {
 								if (!strstr(handle->last_event->body, logfilter)) {
+									continue;
+								}
+							}
+
+							if (logfilterex) {
+								if (strstr(handle->last_event->body, logfilterex)) {
+									continue;
+								}
+							}
+
+							if (global_profile->hide_mux_log) {
+								if (strstr(handle->last_event->body, "switch_core_file.c:348")) {
 									continue;
 								}
 							}
@@ -859,9 +874,9 @@ static void *msg_thread_run(esl_thread_t *me, void *obj)
 		//sleep_ms(1);
 	}
 
-	esl_mutex_lock(MUTEX);  
+	esl_mutex_lock(MUTEX);
 	thread_up = 0;
-	esl_mutex_unlock(MUTEX);  
+	esl_mutex_unlock(MUTEX);
 	thread_running = 0;
 	esl_log(ESL_LOG_DEBUG, "Thread Done\n");
 	return NULL;
@@ -870,26 +885,29 @@ static void *msg_thread_run(esl_thread_t *me, void *obj)
 static const char *cli_usage =
 	"Command                    \tDescription\n"
 	"-----------------------------------------------\n"
-	"/help                      \tHelp\n"
+	"/help, /?                  \tHelp\n"
 	"/exit, /quit, /bye, ...    \tExit the program.\n"
 	"/event, /noevents, /nixevent\tEvent commands.\n"
 	"/log, /nolog               \tLog commands.\n"
 	"/uuid                      \tFilter logs for a single call uuid\n"
 	"/filter                    \tFilter commands.\n"
 	"/logfilter                 \tFilter Log for a single string.\n"
+	"/logfilterex               \tFilter OUT Log for a single string.\n"
 	"/debug [0-7]               \tSet debug level.\n"
+	"/nomux                     \tHide muxing warning log messages.\n"
+	"/mux [on|off]              \tStatus or Hide|Show muxing warning log messages.\n"
 	"\n";
 
 static int process_command(esl_handle_t *handle, const char *cmd)
 {
 	int r = 0;
-	
+
 	while (*cmd == ' ') cmd++;
 
 	esl_mutex_lock(MUTEX);
 
 	if ((*cmd == '/' && cmd++) || !strncasecmp(cmd, "...", 3)) {
-		if (!strcasecmp(cmd, "help")) {
+		if (!strcasecmp(cmd, "help") || !strcasecmp(cmd, "?")) {
 			output_printf("%s", cli_usage);
 			goto end;
 		}
@@ -900,6 +918,16 @@ static int process_command(esl_handle_t *handle, const char *cmd)
 			) {
 			esl_log(ESL_LOG_INFO, "Goodbye!\nSee you at ClueCon http://www.cluecon.com/\n");
 			r = -1; goto end;
+		} else if (!strncasecmp(cmd, "logfilterex", 11)) {
+			cmd += 11;
+			while (cmd && *cmd && *cmd == ' ') { cmd++; }
+			if (!esl_strlen_zero(cmd)) {
+				esl_safe_free(logfilterex);
+				logfilterex = strdup(cmd);
+			} else {
+				esl_safe_free(logfilterex);
+			}
+			output_printf("Logfilter exclusion %s\n", logfilterex ? "enabled" : "disabled");
 		} else if (!strncasecmp(cmd, "logfilter", 9)) {
 			cmd += 9;
 			while (cmd && *cmd && *cmd == ' ') {
@@ -933,12 +961,45 @@ static int process_command(esl_handle_t *handle, const char *cmd)
 			esl_send_recv(handle, cmd);
 			printf("%s\n", handle->last_sr_reply);
 		} else if (!strncasecmp(cmd, "debug", 5)) {
-			int tmp_debug = atoi(cmd+6);
+			int tmp_debug = atoi(cmd + 6);
 			if (tmp_debug > -1 && tmp_debug < 8) {
 				esl_global_set_default_logger(tmp_debug);
 				output_printf("fs_cli debug level set to %d\n", tmp_debug);
 			} else {
 				output_printf("fs_cli debug level must be 0 - 7\n");
+			}
+		} else if (!strncasecmp(cmd, "nomux", 5)) {
+			if (global_profile->hide_mux_log) {
+				global_profile->hide_mux_log = 0;
+			} else {
+				global_profile->hide_mux_log = 1;
+			}
+			output_printf("Muxing log messages are now %s\n", global_profile->hide_mux_log ? "hidden" : "visible");
+		} else if (!strncasecmp(cmd, "mux", 3)) {
+			cmd += 3;
+			while (cmd && *cmd && *cmd == ' ') {
+				cmd++;
+			}
+			if (!esl_strlen_zero(cmd)) {
+				if (!strncasecmp(cmd, "on", 2)) {
+					if (global_profile->hide_mux_log) {
+						output_printf("Muxing log messages remains visible\n");
+					} else {
+						global_profile->hide_mux_log = 1;
+						output_printf("Muxing log messages are now visible\n");
+					}
+				} else if (!strncasecmp(cmd, "off", 3)) {
+					if (!global_profile->hide_mux_log) {
+						output_printf("Muxing log messages remains hidden\n");
+					} else {
+						global_profile->hide_mux_log = 0;
+						output_printf("Muxing log messages are now hidden\n");
+					}
+				} else {
+					output_printf("Usage: /mux [on|off]\n");
+				}
+			} else {
+				output_printf("Muxing log messages are %s\n", global_profile->hide_mux_log ? "hidden" : "visible");
 			}
 		} else {
 			output_printf("Unknown command [%s]\n", cmd);
@@ -947,7 +1008,7 @@ static int process_command(esl_handle_t *handle, const char *cmd)
 		char cmd_str[1024] = "";
 		const char *err = NULL;
 
-		if (!strncasecmp(cmd, "console loglevel ", 17)) { 
+		if (!strncasecmp(cmd, "console loglevel ", 17)) {
 			snprintf(cmd_str, sizeof(cmd_str), "log %s", cmd + 17);
 			esl_send_recv(handle, cmd_str);
 			printf("%s\n", handle->last_sr_reply);
@@ -966,11 +1027,11 @@ static int process_command(esl_handle_t *handle, const char *cmd)
 			}
 		}
 	}
-	
+
  end:
 
 	esl_mutex_unlock(MUTEX);
-		
+
 	return r;
 }
 
@@ -1006,7 +1067,7 @@ static const char *basic_gets(int *cnt)
 			size_t command_buf_len;
 			if (fgets(command_buf, sizeof(command_buf) - 1, stdin) != command_buf) {
 				break;
-			}			
+			}
 			if ((command_buf_len = strlen(command_buf)) > 0) {
 				command_buf[command_buf_len - 1] = '\0'; /* remove endline */
 			}
@@ -1059,7 +1120,7 @@ static const char *banner =
     ".=======================================================.\n"
     "\n";
 
-static const char *inf = "Type /help <enter> to see a list of commands\n\n\n";
+static const char *inf = "Type /help or /? <enter> to see a list of commands\n\n\n";
 
 static void print_banner(FILE *stream, int color)
 {
@@ -1107,9 +1168,10 @@ static void print_banner(FILE *stream, int color)
 		fprintf(stream, "%s", output_text_color);
 	}
 #endif
+	if (global_profile) {
+		if (x < 160) { fprintf(stream, "\n[This app Best viewed at 160x60 or more..]\n"); }
 
-	if (x < 160) {
-		fprintf(stream, "\n[This app Best viewed at 160x60 or more..]\n");
+		if (global_profile->hide_mux_log) { fprintf(stream, "\nMuxing warnings logs are hidden\n"); }
 	}
 }
 
@@ -1194,7 +1256,7 @@ static unsigned char esl_console_complete(const char *buffer, const char *cursor
 	esl_mutex_lock(MUTEX);
 	esl_send_recv(global_handle, cmd_str);
 	esl_mutex_unlock(MUTEX);
-	
+
 	if (global_handle->last_sr_event && global_handle->last_sr_event->body) {
 		char *r = global_handle->last_sr_event->body;
 		char *w, *p1;
@@ -1328,7 +1390,9 @@ static void read_config(const char *dft_cfile, const char *cfile) {
 				}
 			} else if(!strcasecmp(var, "quiet")) {
 				profiles[pcount-1].quiet = esl_true(val);
-			} else if(!strcasecmp(var, "no-history-file")) {
+			} else if (!strcasecmp(var, "hide-mux")) {
+				profiles[pcount - 1].hide_mux_log = esl_true(val);
+			} else if (!strcasecmp(var, "no-history-file")) {
 				profiles[pcount-1].use_history_file = !esl_true(val);
 			} else if(!strcasecmp(var, "prompt-color")) {
 				esl_set_string(profiles[pcount-1].prompt_color, match_color(val));
@@ -1382,7 +1446,7 @@ static void expand_prompt(char *s, size_t len, cli_profile_t *profile)
 	for (p = s; p && *p; p++) {
 		if (*p == '%') {
 			p++;
-			
+
 			switch(*p) {
 			case 's':
 				esl_copy_string(q, switchname, len - (q - &tmp[0]));
@@ -1470,6 +1534,7 @@ int main(int argc, char *argv[])
 		{"timeout", 1, 0, 't'},
 		{"connect-timeout", 1, 0, 'T'},
 		{"set-log-uuid", 1, 0, 's'},
+		{"muxing-hide", 0, 0, 'm'},
 		{0, 0, 0, 0}
 	};
 	char temp_host[128];
@@ -1490,13 +1555,14 @@ int main(int argc, char *argv[])
 	int argv_log_uuid_short = 0;
 	int argv_quiet = 0;
 	int argv_batch = 0;
+	int argv_hide_mux_log = 0;
 	int loops = 2, reconnect = 0;
 	char *ccheck;
 
 	gethostname(hostname, sizeof(hostname));
 
 	esl_mutex_create(&MUTEX);
-			
+
 #if HAVE_DECL_EL_PROMPT_ESC
 	feature_level = 1;
 #else
@@ -1542,7 +1608,7 @@ int main(int argc, char *argv[])
 	esl_global_set_default_logger(6); /* default debug level to 6 (info) */
 	for(;;) {
 		int option_index = 0;
-		opt = getopt_long(argc, argv, "H:P:u:p:d:x:l:USt:T:qQrRhib?ns:", options, &option_index);
+		opt = getopt_long(argc, argv, "H:P:u:p:d:x:l:USt:T:qQrRhib?ns:m", options, &option_index);
 		if (opt == -1) break;
 		switch (opt) {
 			case 'H':
@@ -1621,10 +1687,13 @@ int main(int argc, char *argv[])
 				esl_set_string(argv_filter_uuid, optarg);
 				filter_uuid = strdup(argv_filter_uuid);
 				break;
+			case 'm':
+				argv_hide_mux_log = 1;
+				break;
 
 			case 'h':
 			case '?':
-				print_banner(stdout, is_color);
+				//print_banner(stdout, is_color);
 				usage(argv[0]);
 				return 0;
 		}
@@ -1644,7 +1713,7 @@ int main(int argc, char *argv[])
 			}
 		}
 	}
-	
+
 	if (!profile) {
 		esl_log(ESL_LOG_DEBUG, "no profiles found, using builtin profile\n");
 		profile = &internal_profile;
@@ -1685,6 +1754,10 @@ int main(int argc, char *argv[])
 		profile->log_uuid = 1;
 		profile->log_uuid_length = log_uuid_short_length;
 	}
+	if (argv_hide_mux_log) {
+		profile->hide_mux_log = 1;
+	}
+
 	esl_log(ESL_LOG_DEBUG, "Using profile %s [%s]\n", profile->name, profile->host);
 	esl_set_string(prompt_color, profile->prompt_color);
 	esl_set_string(input_text_color, profile->input_text_color);
@@ -1864,7 +1937,7 @@ int main(int argc, char *argv[])
 		setvbuf(stdout, (char*)NULL, _IONBF, 0);
 	}
 	print_banner(stdout, is_color);
-	esl_log(ESL_LOG_INFO, "FS CLI Ready.\nenter /help for a list of commands.\n");
+	esl_log(ESL_LOG_INFO, "FS CLI Ready.\nenter /help or /? for a list of commands.\n");
 	output_printf("%s\n", handle.last_sr_reply);
 	while (running > 0) {
 		int r;
@@ -1916,7 +1989,7 @@ int main(int argc, char *argv[])
 		esl_mutex_unlock(MUTEX);
 		sleep_ms(10);
 	} while (check_up > 0);
-	
+
 	esl_mutex_destroy(&MUTEX);
 
 	return 0;
